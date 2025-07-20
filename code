@@ -1,0 +1,2104 @@
+import sys
+import sqlite3
+import re
+import io
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QLabel, QPushButton,
+    QVBoxLayout, QHBoxLayout, QFormLayout, QLineEdit, QTableWidget,
+    QTableWidgetItem, QMessageBox, QComboBox, QDateEdit, QDialog,
+    QSpinBox, QFrame, QStackedWidget
+)
+from PyQt6.QtCore import Qt, QDate
+from PyQt6.QtGui import QFont, QColor, QPalette, QLinearGradient, QBrush, QPixmap
+import csv
+import hashlib
+from fpdf import FPDF
+try:
+    import qrcode
+    from PIL import Image
+    QRCODE_AVAILABLE = True
+except ImportError:
+    QRCODE_AVAILABLE = False
+    print("QR code generation disabled - missing dependencies")
+
+class BusDataModel:
+    def __init__(self):
+        try:
+            self.conn = sqlite3.connect("bus_company.db")
+            self.cursor = self.conn.cursor()
+            self.init_db()
+        except sqlite3.OperationalError as e:
+            QMessageBox.critical(None, "Database Error", f"Failed to connect to database: {e}")
+            raise
+
+    def init_db(self):
+        try:
+            self.cursor.execute('''CREATE TABLE IF NOT EXISTS routes (
+                name TEXT PRIMARY KEY, seats INTEGER, departure_time TEXT, price REAL, origin TEXT, destination TEXT)''')
+            self.cursor.execute('''CREATE TABLE IF NOT EXISTS drivers (
+                name TEXT, route TEXT, license_no TEXT, experience_years INTEGER, PRIMARY KEY (name, route))''')
+            self.cursor.execute('''CREATE TABLE IF NOT EXISTS bookings (
+                passenger TEXT, route TEXT, date TEXT, seat_no INTEGER, payment_status TEXT, email TEXT, phone TEXT)''')
+            self.cursor.execute('''CREATE TABLE IF NOT EXISTS cargo (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, sender TEXT, receiver TEXT, route TEXT, date TEXT, 
+                description TEXT, payment_status TEXT, weight REAL, sender_phone TEXT, receiver_phone TEXT)''')
+            self.cursor.execute('''CREATE TABLE IF NOT EXISTS users (
+                username TEXT PRIMARY KEY, password TEXT, role TEXT)''')
+            hashed_password = hashlib.sha256('admin123'.encode()).hexdigest()
+            self.cursor.execute("INSERT OR IGNORE INTO users (username, password, role) VALUES (?, ?, ?)",
+                             ('admin', hashed_password, 'admin'))
+            self.conn.commit()
+            print("Database initialized successfully")
+        except sqlite3.OperationalError as e:
+            QMessageBox.critical(None, "Database Error", f"Database initialization failed: {e}")
+            raise
+
+    def validate_email(self, email):
+        pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+        return bool(re.match(pattern, email))
+
+    def validate_phone(self, phone):
+        pattern = r'^\+\d{10,15}$'
+        return bool(re.match(pattern, phone))
+
+    def send_sms(self, phone, message):
+        print(f"Sending SMS to {phone}: {message}")
+        return True, "SMS sent successfully"
+
+    def add_route(self, name, seats, departure_time, price, origin, destination):
+        if not name.strip() or seats < 1 or price < 0:
+            return False, "Route name cannot be empty, seats and price must be positive."
+        try:
+            self.cursor.execute("INSERT INTO routes (name, seats, departure_time, price, origin, destination) VALUES (?, ?, ?, ?, ?, ?)", 
+                               (name.strip(), seats, departure_time, price, origin.strip(), destination.strip()))
+            self.conn.commit()
+            return True, f"Route '{name}' added successfully."
+        except sqlite3.IntegrityError:
+            return False, "Route name already exists."
+
+    def get_routes(self):
+        self.cursor.execute("SELECT name, seats, departure_time, price, origin, destination FROM routes")
+        return self.cursor.fetchall()
+
+    def add_driver(self, name, route, license_no, experience_years):
+        if not name.strip() or not license_no.strip():
+            return False, "Driver name and license number cannot be empty."
+        try:
+            self.cursor.execute("INSERT INTO drivers (name, route, license_no, experience_years) VALUES (?, ?, ?, ?)", 
+                               (name.strip(), route, license_no.strip(), experience_years))
+            self.conn.commit()
+            return True, f"Driver '{name}' assigned to '{route}'."
+        except sqlite3.IntegrityError:
+            return False, "Driver already assigned to this route."
+
+    def get_drivers(self):
+        self.cursor.execute("SELECT name, route, license_no, experience_years FROM drivers")
+        return self.cursor.fetchall()
+
+    def book_passenger(self, name, route, date, seat_no, payment_status, email, phone):
+        if not name.strip():
+            return False, "Passenger name cannot be empty."
+        if not self.validate_email(email):
+            return False, "Invalid email format."
+        if not self.validate_phone(phone):
+            return False, "Invalid phone number format (e.g., +1234567890)."
+        if QDate.fromString(date, "yyyy-MM-dd") < QDate.currentDate():
+            return False, "Booking date cannot be in the past."
+        self.cursor.execute("SELECT seats FROM routes WHERE name = ?", (route,))
+        max_seats = self.cursor.fetchone()
+        if not max_seats:
+            return False, "Route does not exist."
+        max_seats = max_seats[0]
+        if seat_no < 1 or seat_no > max_seats:
+            return False, f"Seat number must be between 1 and {max_seats}."
+        self.cursor.execute("SELECT seat_no FROM bookings WHERE route = ? AND date = ?", (route, date))
+        taken_seats = [row[0] for row in self.cursor.fetchall()]
+        if seat_no in taken_seats:
+            return False, "Seat already booked."
+        self.cursor.execute("INSERT INTO bookings (passenger, route, date, seat_no, payment_status, email, phone) VALUES (?, ?, ?, ?, ?, ?, ?)", 
+                           (name.strip(), route, date, seat_no, payment_status, email, phone))
+        self.conn.commit()
+        sms_message = f"Booking confirmed for {name} on {route} for {date}, Seat {seat_no}, Status: {payment_status}"
+        self.send_sms(phone, sms_message)
+        return True, f"Passenger '{name}' booked on '{route}' for {date}, seat {seat_no}. SMS sent."
+
+    def add_cargo(self, sender, receiver, route, date, description, payment_status, weight, sender_phone, receiver_phone):
+        if not sender.strip() or not receiver.strip() or not description.strip():
+            return False, "Sender, receiver, and description cannot be empty."
+        if not self.validate_phone(sender_phone) or not self.validate_phone(receiver_phone):
+            return False, "Invalid phone number format (e.g., +1234567890)."
+        if QDate.fromString(date, "yyyy-MM-dd") < QDate.currentDate():
+            return False, "Cargo booking date cannot be in the past."
+        if weight <= 0:
+            return False, "Weight must be positive."
+        self.cursor.execute("SELECT name FROM routes WHERE name = ?", (route,))
+        if not self.cursor.fetchone():
+            return False, "Route does not exist."
+        self.cursor.execute("INSERT INTO cargo (sender, receiver, route, date, description, payment_status, weight, sender_phone, receiver_phone) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", 
+                           (sender.strip(), receiver.strip(), route, date, description.strip(), payment_status, weight, sender_phone, receiver_phone))
+        self.conn.commit()
+        self.cursor.execute("SELECT last_insert_rowid()")
+        cargo_id = self.cursor.fetchone()[0]
+        sms_message = f"Cargo booking confirmed, ID: {cargo_id}, Route: {route}, Date: {date}, Status: {payment_status}"
+        self.send_sms(sender_phone, sms_message)
+        self.send_sms(receiver_phone, sms_message)
+        return True, f"Cargo booked with ID {cargo_id}. SMS sent.", cargo_id
+
+    def get_cargo(self):
+        self.cursor.execute("SELECT id, sender, receiver, route, date, description, payment_status, weight, sender_phone, receiver_phone FROM cargo")
+        return self.cursor.fetchall()
+
+    def get_bookings(self):
+        self.cursor.execute("SELECT passenger, route, date, seat_no, payment_status, email, phone FROM bookings")
+        return self.cursor.fetchall()
+
+    def search_bookings(self, query, search_type="all"):
+        if search_type == "passenger":
+            self.cursor.execute("SELECT passenger, route, date, seat_no, payment_status, email, phone FROM bookings WHERE passenger LIKE ? OR route LIKE ? OR date LIKE ?", 
+                               (f"%{query}%", f"%{query}%", f"%{query}%"))
+        elif search_type == "cargo":
+            self.cursor.execute("SELECT id, sender, receiver, route, date, description, payment_status, weight, sender_phone, receiver_phone FROM cargo WHERE sender LIKE ? OR receiver LIKE ? OR route LIKE ? OR date LIKE ?", 
+                               (f"%{query}%", f"%{query}%", f"%{query}%", f"%{query}%"))
+        else:
+            bookings = self.cursor.execute("SELECT passenger, route, date, seat_no, payment_status, email, phone FROM bookings WHERE passenger LIKE ? OR route LIKE ? OR date LIKE ?", 
+                                         (f"%{query}%", f"%{query}%", f"%{query}%")).fetchall()
+            cargo = self.cursor.execute("SELECT id, sender, receiver, route, date, description, payment_status, weight, sender_phone, receiver_phone FROM cargo WHERE sender LIKE ? OR receiver LIKE ? OR route LIKE ? OR date LIKE ?", 
+                                       (f"%{query}%", f"%{query}%", f"%{query}%", f"%{query}%")).fetchall()
+            return bookings, cargo
+        return self.cursor.fetchall()
+
+    def authenticate_user(self, username, password):
+        try:
+            hashed_password = hashlib.sha256(password.encode()).hexdigest()
+            print(f"Authenticating user: {username}, hashed password: {hashed_password}")
+            self.cursor.execute("SELECT role FROM users WHERE username = ? AND password = ?", (username, hashed_password))
+            result = self.cursor.fetchone()
+            print(f"Query result: {result}")
+            return result[0] if result else None
+        except sqlite3.Error as e:
+            print(f"Authentication error: {e}")
+            QMessageBox.critical(None, "Authentication Error", f"Failed to authenticate: {e}")
+            return None
+
+    def add_user(self, username, password, role):
+        if not username.strip() or not password.strip():
+            return False, "Username and password cannot be empty."
+        try:
+            hashed_password = hashlib.sha256(password.encode()).hexdigest()
+            self.cursor.execute("INSERT INTO users (username, password, role) VALUES (?, ?, ?)", 
+                              (username.strip(), hashed_password, role))
+            self.conn.commit()
+            return True, f"User '{username}' added successfully."
+        except sqlite3.IntegrityError:
+            return False, "Username already exists."
+
+    def delete_user(self, username):
+        if username == "admin":
+            return False, "Cannot delete the default admin user."
+        try:
+            self.cursor.execute("DELETE FROM users WHERE username = ?", (username,))
+            if self.cursor.rowcount == 0:
+                return False, "User not found."
+            self.conn.commit()
+            return True, f"User '{username}' deleted successfully."
+        except sqlite3.Error as e:
+            return False, f"Error deleting user: {e}"
+
+    def get_users(self):
+        self.cursor.execute("SELECT username, role FROM users")
+        return self.cursor.fetchall()
+
+    def export_to_csv(self, filename):
+        try:
+            with open(filename, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(["Routes"])
+                writer.writerow(["Name", "Seats", "Departure Time", "Price", "Origin", "Destination"])
+                for route in self.get_routes():
+                    writer.writerow(route)
+                writer.writerow(["\nDrivers"])
+                writer.writerow(["Name", "Route", "License No", "Experience (Years)"])
+                for driver in self.get_drivers():
+                    writer.writerow(driver)
+                writer.writerow(["\nBookings"])
+                writer.writerow(["Passenger", "Route", "Date", "Seat No", "Payment Status", "Email", "Phone"])
+                for booking in self.get_bookings():
+                    writer.writerow(booking)
+                writer.writerow(["\nCargo"])
+                writer.writerow(["ID", "Sender", "Receiver", "Route", "Date", "Description", "Payment Status", "Weight", "Sender Phone", "Receiver Phone"])
+                for cargo in self.get_cargo():
+                    writer.writerow(cargo)
+                writer.writerow(["\nUsers"])
+                writer.writerow(["Username", "Role"])
+                for user in self.get_users():
+                    writer.writerow(user)
+            return True, "Data exported to bus_data.csv"
+        except Exception as e:
+            return False, f"Export failed: {e}"
+
+    def __del__(self):
+        self.conn.close()
+
+class PDFReceipt(FPDF):
+    def header(self):
+        self.set_font('Arial', 'B', 15)
+        self.cell(0, 10, 'Booking Receipt', 0, 1, 'C')
+
+    def booking_info(self, booking_type, data, qr_data):
+        self.set_font('Arial', '', 12)
+        self.cell(0, 10, f'Booking Type: {booking_type}', 0, 1)
+        for key, value in data.items():
+            self.cell(0, 10, f'{key}: {value}', 0, 1)
+        
+        if QRCODE_AVAILABLE:
+            try:
+                qr = qrcode.QRCode(version=1, box_size=10, border=4)
+                qr.add_data(qr_data)
+                qr.make(fit=True)
+                qr_img = qr.make_image(fill_color="black", back_color="white")
+                qr_buffer = io.BytesIO()
+                qr_img.save(qr_buffer, format="PNG")
+                qr_buffer.seek(0)
+                self.image(qr_buffer, x=10, y=self.get_y() + 10, w=50)
+                self.set_y(self.get_y() + 60)
+            except Exception as e:
+                print(f"Error generating QR code: {e}")
+                self.cell(0, 10, "QR code generation failed", 0, 1)
+        else:
+            self.cell(0, 10, "QR code generation not available", 0, 1)
+
+class BusCompanyApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Modern Bus Company Management System")
+        self.setFixedSize(1200, 800)
+        try:
+            self.model = BusDataModel()
+        except Exception as e:
+            QMessageBox.critical(None, "Initialization Error", f"Failed to initialize application: {e}")
+            sys.exit(1)
+        self.user_role = None
+        self.active_dialog = None
+        self.show_login_screen()
+
+    def show_login_screen(self):
+        self.user_role = None
+        
+        login_dialog = QDialog(self)
+        login_dialog.setWindowTitle("Login")
+        login_dialog.setFixedSize(500, 400)
+        
+        palette = login_dialog.palette()
+        gradient = QLinearGradient(0, 0, 0, 400)
+        gradient.setColorAt(0.0, QColor(30, 100, 150))
+        gradient.setColorAt(1.0, QColor(50, 150, 200))
+        palette.setBrush(QPalette.ColorRole.Window, QBrush(gradient))
+        login_dialog.setPalette(palette)
+        
+        layout = QVBoxLayout(login_dialog)
+        layout.setContentsMargins(40, 40, 40, 40)
+        layout.setSpacing(20)
+        
+        header = QLabel("Bus Management System")
+        header.setStyleSheet("""
+            font-size: 28px;
+            font-weight: bold;
+            color: white;
+            qproperty-alignment: AlignCenter;
+        """)
+        layout.addWidget(header)
+        
+        icon_label = QLabel()
+        icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(icon_label)
+        
+        form_frame = QFrame()
+        form_frame.setStyleSheet("""
+            QFrame {
+                background-color: rgba(255, 255, 255, 200);
+                border-radius: 10px;
+                padding: 20px;
+            }
+        """)
+        form_layout = QFormLayout(form_frame)
+        form_layout.setSpacing(15)
+        form_layout.setContentsMargins(20, 20, 20, 20)
+        
+        username_input = QLineEdit()
+        username_input.setPlaceholderText("Enter username")
+        username_input.setStyleSheet("""
+            QLineEdit {
+                padding: 10px;
+                border: 2px solid #4a90e2;
+                border-radius: 5px;
+                font-size: 14px;
+                background-color: white;
+            }
+            QLineEdit:focus {
+                border-color: #28a745;
+            }
+        """)
+        
+        password_input = QLineEdit()
+        password_input.setPlaceholderText("Enter password")
+        password_input.setEchoMode(QLineEdit.EchoMode.Password)
+        password_input.setStyleSheet(username_input.styleSheet())
+        
+        form_layout.addRow("Username:", username_input)
+        form_layout.addRow("Password:", password_input)
+        
+        layout.addWidget(form_frame)
+        
+        btn_box = QHBoxLayout()
+        btn_box.setSpacing(15)
+        
+        btn_login = QPushButton("Login")
+        btn_login.setStyleSheet("""
+            QPushButton {
+                background-color: #28a745;
+                color: white;
+                padding: 12px 24px;
+                border-radius: 5px;
+                font-size: 16px;
+                font-weight: bold;
+                min-width: 120px;
+            }
+            QPushButton:hover {
+                background-color: #218838;
+            }
+            QPushButton:pressed {
+                background-color: #1c6e30;
+            }
+        """)
+        btn_login.clicked.connect(lambda: self.login(username_input.text(), password_input.text(), login_dialog))
+        
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.setStyleSheet("""
+            QPushButton {
+                background-color: #dc3545;
+                color: white;
+                padding: 12px 24px;
+                border-radius: 5px;
+                font-size: 16px;
+                font-weight: bold;
+                min-width: 120px;
+            }
+            QPushButton:hover {
+                background-color: #c82333;
+            }
+            QPushButton:pressed {
+                background-color: #b21f2d;
+            }
+        """)
+        btn_cancel.clicked.connect(login_dialog.reject)
+        
+        btn_box.addWidget(btn_login)
+        btn_box.addWidget(btn_cancel)
+        layout.addLayout(btn_box)
+        
+        login_dialog.exec()
+        if not self.user_role:
+            sys.exit()
+
+    def login(self, username, password, dialog):
+        try:
+            print(f"Attempting login with username: {username}")
+            role = self.model.authenticate_user(username, password)
+            print(f"Role returned: {role}")
+            if role:
+                self.user_role = role
+                print("Initializing UI")
+                self.init_ui()
+                dialog.accept()
+            else:
+                QMessageBox.warning(self, "Error", "Invalid username or password")
+        except Exception as e:
+            print(f"Login error: {e}")
+            QMessageBox.critical(self, "Login Error", f"Failed to login: {e}")
+
+    def logout(self):
+        QMessageBox.information(self, "Logout", "Logged out manually.")
+        self.show_login_screen()
+
+    def init_ui(self):
+        self.setStyleSheet("""
+            QMainWindow {
+                background-color: #f5f7fa;
+            }
+        """)
+        
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        main_layout = QVBoxLayout(central_widget)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+        
+        header = QWidget()
+        header.setFixedHeight(80)
+        header.setStyleSheet("""
+            QWidget {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #1e3c72, stop:1 #2a5298);
+                color: white;
+            }
+        """)
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(20, 0, 20, 0)
+        
+        title = QLabel("Bus Company Management System")
+        title.setStyleSheet("""
+            QLabel {
+                font-size: 24px;
+                font-weight: bold;
+                color: white;
+            }
+        """)
+        header_layout.addWidget(title)
+        
+        user_info = QLabel(f"Logged in as: {self.user_role.capitalize()}")
+        user_info.setStyleSheet("""
+            QLabel {
+                font-size: 14px;
+                color: white;
+            }
+        """)
+        header_layout.addWidget(user_info)
+        
+        logout_button = QPushButton("Logout")
+        logout_button.setStyleSheet("""
+            QPushButton {
+                background-color: #dc3545;
+                color: white;
+                padding: 8px 16px;
+                border-radius: 4px;
+                font-size: 14px;
+                min-width: 80px;
+            }
+            QPushButton:hover {
+                background-color: #c82333;
+            }
+            QPushButton:pressed {
+                background-color: #b21f2d;
+            }
+        """)
+        logout_button.clicked.connect(self.logout)
+        header_layout.addWidget(logout_button)
+        
+        main_layout.addWidget(header)
+        
+        content_widget = QWidget()
+        content_layout = QHBoxLayout(content_widget)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(0)
+        
+        sidebar = QWidget()
+        sidebar.setFixedWidth(200)
+        sidebar.setStyleSheet("""
+            QWidget {
+                background-color: #2c3e50;
+            }
+            QPushButton {
+                background-color: transparent;
+                color: white;
+                text-align: left;
+                padding: 12px 20px;
+                border: none;
+                font-size: 14px;
+            }
+            QPushButton:hover {
+                background-color: #34495e;
+            }
+            QPushButton:pressed {
+                background-color: #2c3e50;
+            }
+            QPushButton[active="true"] {
+                background-color: #3498db;
+                font-weight: bold;
+            }
+        """)
+        
+        sidebar_layout = QVBoxLayout(sidebar)
+        sidebar_layout.setContentsMargins(0, 20, 0, 20)
+        sidebar_layout.setSpacing(5)
+        
+        self.btn_routes = QPushButton("Routes")
+        self.btn_drivers = QPushButton("Drivers")
+        self.btn_bookings = QPushButton("Bookings")
+        self.btn_cargo = QPushButton("Cargo")
+        self.btn_users = QPushButton("Users")
+        self.btn_data = QPushButton("Data")
+        
+        self.stacked_widget = QStackedWidget()
+        self.stacked_widget.setStyleSheet("""
+            QStackedWidget {
+                background-color: white;
+                border-left: 1px solid #ddd;
+            }
+        """)
+        
+        if self.user_role == "cashier":
+            self.btn_bookings.setProperty("active", True)
+            self.btn_bookings.clicked.connect(lambda: self.stacked_widget.setCurrentIndex(0))
+            sidebar_layout.addWidget(self.btn_bookings)
+            self.create_bookings_page()
+        elif self.user_role == "clerk":
+            self.btn_cargo.setProperty("active", True)
+            self.btn_cargo.clicked.connect(lambda: self.stacked_widget.setCurrentIndex(0))
+            sidebar_layout.addWidget(self.btn_cargo)
+            self.create_cargo_page()
+        else:  # admin or manager
+            self.btn_routes.setProperty("active", True)
+            self.btn_routes.clicked.connect(lambda: self.stacked_widget.setCurrentIndex(0))
+            self.btn_drivers.clicked.connect(lambda: self.stacked_widget.setCurrentIndex(1))
+            self.btn_bookings.clicked.connect(lambda: self.stacked_widget.setCurrentIndex(2))
+            self.btn_cargo.clicked.connect(lambda: self.stacked_widget.setCurrentIndex(3))
+            self.btn_users.clicked.connect(lambda: self.stacked_widget.setCurrentIndex(4))
+            self.btn_data.clicked.connect(lambda: self.stacked_widget.setCurrentIndex(5))
+            sidebar_layout.addWidget(self.btn_routes)
+            sidebar_layout.addWidget(self.btn_drivers)
+            sidebar_layout.addWidget(self.btn_bookings)
+            sidebar_layout.addWidget(self.btn_cargo)
+            sidebar_layout.addWidget(self.btn_users)
+            sidebar_layout.addWidget(self.btn_data)
+            self.create_routes_page()
+            self.create_drivers_page()
+            self.create_bookings_page()
+            self.create_cargo_page()
+            self.create_users_page()
+            self.create_data_page()
+        
+        sidebar_layout.addStretch()
+        content_layout.addWidget(sidebar)
+        content_layout.addWidget(self.stacked_widget)
+        main_layout.addWidget(content_widget)
+        
+        self.apply_role_permissions()
+        self.update_button_states()
+        print(f"UI initialized for role: {self.user_role}")
+
+    def create_routes_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(20, 20, 20, 20)
+        
+        header = QLabel("Route Management")
+        header.setStyleSheet("""
+            QLabel {
+                font-size: 20px;
+                font-weight: bold;
+                color: #2c3e50;
+                margin-bottom: 20px;
+            }
+        """)
+        layout.addWidget(header)
+        
+        btn_add = QPushButton("Add New Route")
+        btn_add.setStyleSheet("""
+            QPushButton {
+                background-color: #28a745;
+                color: white;
+                padding: 10px 20px;
+                border-radius: 5px;
+                font-size: 14px;
+                min-width: 150px;
+            }
+            QPushButton:hover {
+                background-color: #218838;
+            }
+            QPushButton:pressed {
+                background-color: #1c6e30;
+            }
+        """)
+        btn_add.clicked.connect(self.add_route_dialog)
+        layout.addWidget(btn_add, alignment=Qt.AlignmentFlag.AlignLeft)
+        
+        self.route_table = QTableWidget()
+        self.route_table.setStyleSheet("""
+            QTableWidget {
+                border: 1px solid #ddd;
+                border-radius: 5px;
+                background-color: white;
+                alternate-background-color: #f9f9f9;
+            }
+            QHeaderView::section {
+                background-color: #3498db;
+                color: white;
+                padding: 8px;
+                border: none;
+                font-weight: bold;
+            }
+            QTableWidget::item {
+                padding: 8px;
+                border-bottom: 1px solid #eee;
+            }
+        """)
+        self.route_table.setColumnCount(6)
+        self.route_table.setHorizontalHeaderLabels(["Name", "Seats", "Departure", "Price", "Origin", "Destination"])
+        self.route_table.horizontalHeader().setStretchLastSection(True)
+        self.route_table.verticalHeader().setVisible(False)
+        self.route_table.setAlternatingRowColors(True)
+        
+        layout.addWidget(self.route_table)
+        self.stacked_widget.addWidget(page)
+        self.update_route_table()
+
+    def create_drivers_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(20, 20, 20, 20)
+        
+        header = QLabel("Driver Management")
+        header.setStyleSheet("""
+            QLabel {
+                font-size: 20px;
+                font-weight: bold;
+                color: #2c3e50;
+                margin-bottom: 20px;
+            }
+        """)
+        layout.addWidget(header)
+        
+        btn_add = QPushButton("Assign Driver")
+        btn_add.setStyleSheet("""
+            QPushButton {
+                background-color: #28a745;
+                color: white;
+                padding: 10px 20px;
+                border-radius: 5px;
+                font-size: 14px;
+                min-width: 150px;
+            }
+            QPushButton:hover {
+                background-color: #218838;
+            }
+            QPushButton:pressed {
+                background-color: #1c6e30;
+            }
+        """)
+        btn_add.clicked.connect(self.add_driver_dialog)
+        layout.addWidget(btn_add, alignment=Qt.AlignmentFlag.AlignLeft)
+        
+        self.driver_table = QTableWidget()
+        self.driver_table.setStyleSheet("""
+            QTableWidget {
+                border: 1px solid #ddd;
+                border-radius: 5px;
+                background-color: white;
+                alternate-background-color: #f9f9f9;
+            }
+            QHeaderView::section {
+                background-color: #3498db;
+                color: white;
+                padding: 8px;
+                border: none;
+                font-weight: bold;
+            }
+            QTableWidget::item {
+                padding: 8px;
+                border-bottom: 1px solid #eee;
+            }
+        """)
+        self.driver_table.setColumnCount(4)
+        self.driver_table.setHorizontalHeaderLabels(["Name", "Route", "License No", "Experience"])
+        self.driver_table.horizontalHeader().setStretchLastSection(True)
+        self.driver_table.verticalHeader().setVisible(False)
+        self.driver_table.setAlternatingRowColors(True)
+        
+        layout.addWidget(self.driver_table)
+        self.stacked_widget.addWidget(page)
+        self.update_driver_table()
+
+    def create_bookings_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(20, 20, 20, 20)
+        
+        header = QLabel("Booking Management")
+        header.setStyleSheet("""
+            QLabel {
+                font-size: 20px;
+                font-weight: bold;
+                color: #2c3e50;
+                margin-bottom: 20px;
+            }
+        """)
+        layout.addWidget(header)
+        
+        btn_row = QHBoxLayout()
+        
+        btn_book = QPushButton("New Booking")
+        btn_book.setStyleSheet("""
+            QPushButton {
+                background-color: #28a745;
+                color: white;
+                padding: 10px 20px;
+                border-radius: 5px;
+                font-size: 14px;
+                min-width: 150px;
+            }
+            QPushButton:hover {
+                background-color: #218838;
+            }
+            QPushButton:pressed {
+                background-color: #1c6e30;
+            }
+        """)
+        btn_book.clicked.connect(self.book_passenger_dialog)
+        
+        btn_search = QPushButton("Search Bookings")
+        btn_search.setStyleSheet("""
+            QPushButton {
+                background-color: #17a2b8;
+                color: white;
+                padding: 10px 20px;
+                border-radius: 5px;
+                font-size: 14px;
+                min-width: 150px;
+            }
+            QPushButton:hover {
+                background-color: #138496;
+            }
+            QPushButton:pressed {
+                background-color: #117a8b;
+            }
+        """)
+        btn_search.clicked.connect(self.search_dialog)
+        
+        btn_row.addWidget(btn_book)
+        btn_row.addWidget(btn_search)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+        
+        self.booking_table = QTableWidget()
+        self.booking_table.setStyleSheet("""
+            QTableWidget {
+                border: 1px solid #ddd;
+                border-radius: 5px;
+                background-color: white;
+                alternate-background-color: #f9f9f9;
+            }
+            QHeaderView::section {
+                background-color: #3498db;
+                color: white;
+                padding: 8px;
+                border: none;
+                font-weight: bold;
+            }
+            QTableWidget::item {
+                padding: 8px;
+                border-bottom: 1px solid #eee;
+            }
+        """)
+        self.booking_table.setColumnCount(7)
+        self.booking_table.setHorizontalHeaderLabels(["Passenger", "Route", "Date", "Seat", "Status", "Email", "Phone"])
+        self.booking_table.horizontalHeader().setStretchLastSection(True)
+        self.booking_table.verticalHeader().setVisible(False)
+        self.booking_table.setAlternatingRowColors(True)
+        
+        layout.addWidget(self.booking_table)
+        self.stacked_widget.addWidget(page)
+        self.update_booking_table()
+
+    def create_cargo_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(20, 20, 20, 20)
+        
+        header = QLabel("Cargo Management")
+        header.setStyleSheet("""
+            QLabel {
+                font-size: 20px;
+                font-weight: bold;
+                color: #2c3e50;
+                margin-bottom: 20px;
+            }
+        """)
+        layout.addWidget(header)
+        
+        btn_add = QPushButton("Book Cargo")
+        btn_add.setStyleSheet("""
+            QPushButton {
+                background-color: #28a745;
+                color: white;
+                padding: 10px 20px;
+                border-radius: 5px;
+                font-size: 14px;
+                min-width: 150px;
+            }
+            QPushButton:hover {
+                background-color: #218838;
+            }
+            QPushButton:pressed {
+                background-color: #1c6e30;
+            }
+        """)
+        btn_add.clicked.connect(self.add_cargo_dialog)
+        layout.addWidget(btn_add, alignment=Qt.AlignmentFlag.AlignLeft)
+        
+        self.cargo_table = QTableWidget()
+        self.cargo_table.setStyleSheet("""
+            QTableWidget {
+                border: 1px solid #ddd;
+                border-radius: 5px;
+                background-color: white;
+                alternate-background-color: #f9f9f9;
+            }
+            QHeaderView::section {
+                background-color: #3498db;
+                color: white;
+                padding: 8px;
+                border: none;
+                font-weight: bold;
+            }
+            QTableWidget::item {
+                padding: 8px;
+                border-bottom: 1px solid #eee;
+            }
+        """)
+        self.cargo_table.setColumnCount(6)
+        self.cargo_table.setHorizontalHeaderLabels(["ID", "Sender", "Receiver", "Route", "Date", "Status"])
+        self.cargo_table.horizontalHeader().setStretchLastSection(True)
+        self.cargo_table.verticalHeader().setVisible(False)
+        self.cargo_table.setAlternatingRowColors(True)
+        
+        layout.addWidget(self.cargo_table)
+        self.stacked_widget.addWidget(page)
+        self.update_cargo_table()
+
+    def create_users_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(20, 20, 20, 20)
+        
+        header = QLabel("User Management")
+        header.setStyleSheet("""
+            QLabel {
+                font-size: 20px;
+                font-weight: bold;
+                color: #2c3e50;
+                margin-bottom: 20px;
+            }
+        """)
+        layout.addWidget(header)
+        
+        btn_row = QHBoxLayout()
+        
+        btn_add = QPushButton("Add User")
+        btn_add.setStyleSheet("""
+            QPushButton {
+                background-color: #28a745;
+                color: white;
+                padding: 10px 20px;
+                border-radius: 5px;
+                font-size: 14px;
+                min-width: 150px;
+            }
+            QPushButton:hover {
+                background-color: #218838;
+            }
+            QPushButton:pressed {
+                background-color: #1c6e30;
+            }
+        """)
+        btn_add.clicked.connect(self.add_user_dialog)
+        
+        btn_delete = QPushButton("Delete User")
+        btn_delete.setStyleSheet("""
+            QPushButton {
+                background-color: #dc3545;
+                color: white;
+                padding: 10px 20px;
+                border-radius: 5px;
+                font-size: 14px;
+                min-width: 150px;
+            }
+            QPushButton:hover {
+                background-color: #c82333;
+            }
+            QPushButton:pressed {
+                background-color: #b21f2d;
+            }
+        """)
+        btn_delete.clicked.connect(self.delete_user_dialog)
+        
+        btn_row.addWidget(btn_add)
+        btn_row.addWidget(btn_delete)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+        
+        self.user_table = QTableWidget()
+        self.user_table.setStyleSheet("""
+            QTableWidget {
+                border: 1px solid #ddd;
+                border-radius: 5px;
+                background-color: white;
+                alternate-background-color: #f9f9f9;
+            }
+            QHeaderView::section {
+                background-color: #3498db;
+                color: white;
+                padding: 8px;
+                border: none;
+                font-weight: bold;
+            }
+            QTableWidget::item {
+                padding: 8px;
+                border-bottom: 1px solid #eee;
+            }
+        """)
+        self.user_table.setColumnCount(2)
+        self.user_table.setHorizontalHeaderLabels(["Username", "Role"])
+        self.user_table.horizontalHeader().setStretchLastSection(True)
+        self.user_table.verticalHeader().setVisible(False)
+        self.user_table.setAlternatingRowColors(True)
+        
+        layout.addWidget(self.user_table)
+        self.stacked_widget.addWidget(page)
+        self.update_user_table()
+
+    def create_data_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(20, 20, 20, 20)
+        
+        header = QLabel("Data Management")
+        header.setStyleSheet("""
+            QLabel {
+                font-size: 20px;
+                font-weight: bold;
+                color: #2c3e50;
+                margin-bottom: 20px;
+            }
+        """)
+        layout.addWidget(header)
+        
+        btn_row = QHBoxLayout()
+        
+        btn_view = QPushButton("View All Data")
+        btn_view.setStyleSheet("""
+            QPushButton {
+                background-color: #17a2b8;
+                color: white;
+                padding: 10px 20px;
+                border-radius: 5px;
+                font-size: 14px;
+                min-width: 150px;
+            }
+            QPushButton:hover {
+                background-color: #138496;
+            }
+            QPushButton:pressed {
+                background-color: #117a8b;
+            }
+        """)
+        btn_view.clicked.connect(lambda: self.view_data())
+        
+        btn_export = QPushButton("Export to CSV")
+        btn_export.setStyleSheet("""
+            QPushButton {
+                background-color: #6c757d;
+                color: white;
+                padding: 10px 20px;
+                border-radius: 5px;
+                font-size: 14px;
+                min-width: 150px;
+            }
+            QPushButton:hover {
+                background-color: #5a6268;
+            }
+            QPushButton:pressed {
+                background-color: #4b5155;
+            }
+        """)
+        btn_export.clicked.connect(self.export_data)
+        
+        btn_row.addWidget(btn_view)
+        btn_row.addWidget(btn_export)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+        
+        self.data_table = QTableWidget()
+        self.data_table.setStyleSheet("""
+            QTableWidget {
+                border: 1px solid #ddd;
+                border-radius: 5px;
+                background-color: white;
+                alternate-background-color: #f9f9f9;
+            }
+            QHeaderView::section {
+                background-color: #3498db;
+                color: white;
+                padding: 8px;
+                border: none;
+                font-weight: bold;
+            }
+            QTableWidget::item {
+                padding: 8px;
+                border-bottom: 1px solid #eee;
+            }
+        """)
+        self.data_table.setColumnCount(8)
+        self.data_table.setHorizontalHeaderLabels(["Type", "Name/ID", "Route", "Details", "Extra 1", "Extra 2", "Extra 3", "Extra 4"])
+        self.data_table.horizontalHeader().setStretchLastSection(True)
+        self.data_table.verticalHeader().setVisible(False)
+        self.data_table.setAlternatingRowColors(True)
+        
+        layout.addWidget(self.data_table)
+        self.stacked_widget.addWidget(page)
+        self.view_data()
+
+    def apply_role_permissions(self):
+        print(f"Applying role permissions for: {self.user_role}")
+        if self.user_role == "cashier":
+            if hasattr(self, 'btn_routes'): self.btn_routes.setEnabled(False)
+            if hasattr(self, 'btn_drivers'): self.btn_drivers.setEnabled(False)
+            if hasattr(self, 'btn_users'): self.btn_users.setEnabled(False)
+            if hasattr(self, 'btn_data'): self.btn_data.setEnabled(False)
+            if hasattr(self, 'btn_cargo'): self.btn_cargo.setEnabled(False)
+        elif self.user_role == "clerk":
+            if hasattr(self, 'btn_routes'): self.btn_routes.setEnabled(False)
+            if hasattr(self, 'btn_drivers'): self.btn_drivers.setEnabled(False)
+            if hasattr(self, 'btn_users'): self.btn_users.setEnabled(False)
+            if hasattr(self, 'btn_data'): self.btn_data.setEnabled(False)
+            if hasattr(self, 'btn_bookings'): self.btn_bookings.setEnabled(False)
+        elif self.user_role == "manager":
+            if hasattr(self, 'btn_users'): self.btn_users.setEnabled(False)
+        print("Role permissions applied")
+
+    def update_button_states(self):
+        routes = self.model.get_routes()
+        has_routes = len(routes) > 0
+        print(f"Updating button states, has_routes: {has_routes}")
+        if self.user_role == "admin" or self.user_role == "manager":
+            if hasattr(self, 'btn_routes'): self.btn_routes.setEnabled(True)
+            if hasattr(self, 'btn_drivers'): self.btn_drivers.setEnabled(has_routes)
+            if hasattr(self, 'btn_bookings'): self.btn_bookings.setEnabled(has_routes)
+            if hasattr(self, 'btn_cargo'): self.btn_cargo.setEnabled(has_routes)
+            if hasattr(self, 'btn_users'): self.btn_users.setEnabled(self.user_role == "admin")
+            if hasattr(self, 'btn_data'): self.btn_data.setEnabled(True)
+        elif self.user_role == "cashier":
+            if hasattr(self, 'btn_bookings'): self.btn_bookings.setEnabled(has_routes)
+        elif self.user_role == "clerk":
+            if hasattr(self, 'btn_cargo'): self.btn_cargo.setEnabled(has_routes)
+        print("Button states updated")
+
+    def add_route_dialog(self):
+        print("Opening Add Route dialog")
+        try:
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Add Route")
+            dialog.setFixedSize(500, 400)
+            dialog.setStyleSheet("""
+                QDialog {
+                    background-color: #f5f7fa;
+                }
+                QLabel {
+                    color: #2c3e50;
+                    font-weight: bold;
+                }
+                QLineEdit, QSpinBox {
+                    padding: 8px;
+                    border: 1px solid #ddd;
+                    border-radius: 4px;
+                    font-size: 14px;
+                }
+                QLineEdit:focus, QSpinBox:focus {
+                    border-color: #3498db;
+                }
+            """)
+            self.active_dialog = dialog
+            form = QFormLayout(dialog)
+            form.setSpacing(15)
+            form.setContentsMargins(20, 20, 20, 20)
+
+            route_name_input = QLineEdit()
+            seats_input = QSpinBox()
+            seats_input.setRange(1, 100)
+            seats_input.setValue(50)
+            departure_time_input = QLineEdit()
+            departure_time_input.setPlaceholderText("e.g., 08:30 AM")
+            price_input = QLineEdit()
+            price_input.setPlaceholderText("e.g., 25.50")
+            origin_input = QLineEdit()
+            destination_input = QLineEdit()
+
+            form.addRow("Route Name:", route_name_input)
+            form.addRow("Seat Capacity:", seats_input)
+            form.addRow("Departure Time:", departure_time_input)
+            form.addRow("Price ($):", price_input)
+            form.addRow("Origin:", origin_input)
+            form.addRow("Destination:", destination_input)
+
+            btn_layout = QHBoxLayout()
+            btn_add = QPushButton("Add Route")
+            btn_add.setStyleSheet("""
+                QPushButton {
+                    background-color: #28a745;
+                    color: white;
+                    padding: 10px 20px;
+                    border-radius: 5px;
+                    font-size: 14px;
+                    min-width: 100px;
+                }
+                QPushButton:hover {
+                    background-color: #218838;
+                }
+                QPushButton:pressed {
+                    background-color: #1c6e30;
+                }
+            """)
+            btn_cancel = QPushButton("Cancel")
+            btn_cancel.setStyleSheet("""
+                QPushButton {
+                    background-color: #6c757d;
+                    color: white;
+                    padding: 10px 20px;
+                    border-radius: 5px;
+                    font-size: 14px;
+                    min-width: 100px;
+                }
+                QPushButton:hover {
+                    background-color: #5a6268;
+                }
+                QPushButton:pressed {
+                    background-color: #4b5155;
+                }
+            """)
+            btn_add.clicked.connect(lambda: self.add_route(route_name_input.text(), seats_input.value(), 
+                                                           departure_time_input.text(), price_input.text(), 
+                                                           origin_input.text(), destination_input.text(), dialog))
+            btn_cancel.clicked.connect(lambda: self.close_dialog(dialog))
+            btn_layout.addWidget(btn_add)
+            btn_layout.addWidget(btn_cancel)
+            form.addRow(btn_layout)
+
+            print("Showing Add Route dialog")
+            dialog.exec()
+            self.active_dialog = None
+        except Exception as e:
+            print(f"Error in add_route_dialog: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to open Add Route dialog: {e}")
+
+    def add_route(self, name, seats, departure_time, price, origin, destination, dialog):
+        try:
+            price = float(price)
+            success, message = self.model.add_route(name, seats, departure_time, price, origin, destination)
+            if success:
+                QMessageBox.information(self, "Success", message)
+                self.close_dialog(dialog)
+                self.update_route_table()
+            else:
+                QMessageBox.warning(self, "Error", message)
+        except ValueError:
+            QMessageBox.warning(self, "Error", "Price must be a number.")
+        except Exception as e:
+            print(f"Error in add_route: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to add route: {e}")
+
+    def update_route_table(self):
+        try:
+            routes = self.model.get_routes()
+            self.route_table.setRowCount(len(routes))
+            for i, route in enumerate(routes):
+                self.route_table.setItem(i, 0, QTableWidgetItem(route[0]))
+                self.route_table.setItem(i, 1, QTableWidgetItem(str(route[1])))
+                self.route_table.setItem(i, 2, QTableWidgetItem(route[2]))
+                self.route_table.setItem(i, 3, QTableWidgetItem(f"${route[3]:.2f}"))
+                self.route_table.setItem(i, 4, QTableWidgetItem(route[4]))
+                self.route_table.setItem(i, 5, QTableWidgetItem(route[5]))
+            print("Route table updated")
+        except Exception as e:
+            print(f"Error updating route table: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to update route table: {e}")
+
+    def close_dialog(self, dialog):
+        self.active_dialog = None
+        dialog.accept()
+        print("Dialog closed")
+
+    def add_driver_dialog(self):
+        print("Opening Add Driver dialog")
+        try:
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Assign Driver")
+            dialog.setFixedSize(500, 300)
+            dialog.setStyleSheet("""
+                QDialog {
+                    background-color: #f5f7fa;
+                }
+                QLabel {
+                    color: #2c3e50;
+                    font-weight: bold;
+                }
+                QLineEdit, QSpinBox, QComboBox {
+                    padding: 8px;
+                    border: 1px solid #ddd;
+                    border-radius: 4px;
+                    font-size: 14px;
+                }
+                QLineEdit:focus, QSpinBox:focus, QComboBox:focus {
+                    border-color: #3498db;
+                }
+            """)
+            self.active_dialog = dialog
+            form = QFormLayout(dialog)
+            form.setSpacing(15)
+            form.setContentsMargins(20, 20, 20, 20)
+
+            driver_name_input = QLineEdit()
+            route_selector = QComboBox()
+            route_selector.addItems([r[0] for r in self.model.get_routes()])
+            license_no_input = QLineEdit()
+            experience_input = QSpinBox()
+            experience_input.setRange(0, 50)
+            experience_input.setValue(1)
+
+            form.addRow("Driver Name:", driver_name_input)
+            form.addRow("Assign to Route:", route_selector)
+            form.addRow("License Number:", license_no_input)
+            form.addRow("Experience (Years):", experience_input)
+
+            btn_layout = QHBoxLayout()
+            btn_add = QPushButton("Assign")
+            btn_add.setStyleSheet("""
+                QPushButton {
+                    background-color: #28a745;
+                    color: white;
+                    padding: 10px 20px;
+                    border-radius: 5px;
+                    font-size: 14px;
+                    min-width: 100px;
+                }
+                QPushButton:hover {
+                    background-color: #218838;
+                }
+                QPushButton:pressed {
+                    background-color: #1c6e30;
+                }
+            """)
+            btn_cancel = QPushButton("Cancel")
+            btn_cancel.setStyleSheet("""
+                QPushButton {
+                    background-color: #6c757d;
+                    color: white;
+                    padding: 10px 20px;
+                    border-radius: 5px;
+                    font-size: 14px;
+                    min-width: 100px;
+                }
+                QPushButton:hover {
+                    background-color: #5a6268;
+                }
+                QPushButton:pressed {
+                    background-color: #4b5155;
+                }
+            """)
+            btn_add.clicked.connect(lambda: self.assign_driver(driver_name_input.text(), route_selector.currentText(), 
+                                                              license_no_input.text(), experience_input.value(), dialog))
+            btn_cancel.clicked.connect(lambda: self.close_dialog(dialog))
+            btn_layout.addWidget(btn_add)
+            btn_layout.addWidget(btn_cancel)
+            form.addRow(btn_layout)
+
+            print("Showing Add Driver dialog")
+            dialog.exec()
+            self.active_dialog = None
+        except Exception as e:
+            print(f"Error in add_driver_dialog: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to open Add Driver dialog: {e}")
+
+    def assign_driver(self, name, route, license_no, experience_years, dialog):
+        try:
+            success, message = self.model.add_driver(name, route, license_no, experience_years)
+            if success:
+                QMessageBox.information(self, "Success", message)
+                self.close_dialog(dialog)
+                self.update_driver_table()
+            else:
+                QMessageBox.warning(self, "Error", message)
+        except Exception as e:
+            print(f"Error in assign_driver: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to assign driver: {e}")
+
+    def update_driver_table(self):
+        try:
+            drivers = self.model.get_drivers()
+            self.driver_table.setRowCount(len(drivers))
+            for i, driver in enumerate(drivers):
+                self.driver_table.setItem(i, 0, QTableWidgetItem(driver[0]))
+                self.driver_table.setItem(i, 1, QTableWidgetItem(driver[1]))
+                self.driver_table.setItem(i, 2, QTableWidgetItem(driver[2]))
+                self.driver_table.setItem(i, 3, QTableWidgetItem(str(driver[3])))
+            print("Driver table updated")
+        except Exception as e:
+            print(f"Error updating driver table: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to update driver table: {e}")
+
+    def add_user_dialog(self):
+        print("Opening Add User dialog")
+        try:
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Add User")
+            dialog.setFixedSize(500, 300)
+            dialog.setStyleSheet("""
+                QDialog {
+                    background-color: #f5f7fa;
+                }
+                QLabel {
+                    color: #2c3e50;
+                    font-weight: bold;
+                }
+                QLineEdit, QComboBox {
+                    padding: 8px;
+                    border: 1px solid #ddd;
+                    border-radius: 4px;
+                    font-size: 14px;
+                }
+                QLineEdit:focus, QComboBox:focus {
+                    border-color: #3498db;
+                }
+            """)
+            self.active_dialog = dialog
+            form = QFormLayout(dialog)
+            form.setSpacing(15)
+            form.setContentsMargins(20, 20, 20, 20)
+
+            username_input = QLineEdit()
+            password_input = QLineEdit()
+            password_input.setEchoMode(QLineEdit.EchoMode.Password)
+            role_selector = QComboBox()
+            role_selector.addItems(["admin", "manager", "clerk", "cashier"])
+
+            form.addRow("Username:", username_input)
+            form.addRow("Password:", password_input)
+            form.addRow("Role:", role_selector)
+
+            btn_layout = QHBoxLayout()
+            btn_add = QPushButton("Add User")
+            btn_add.setStyleSheet("""
+                QPushButton {
+                    background-color: #28a745;
+                    color: white;
+                    padding: 10px 20px;
+                    border-radius: 5px;
+                    font-size: 14px;
+                    min-width: 100px;
+                }
+                QPushButton:hover {
+                    background-color: #218838;
+                }
+                QPushButton:pressed {
+                    background-color: #1c6e30;
+                }
+            """)
+            btn_cancel = QPushButton("Cancel")
+            btn_cancel.setStyleSheet("""
+                QPushButton {
+                    background-color: #6c757d;
+                    color: white;
+                    padding: 10px 20px;
+                    border-radius: 5px;
+                    font-size: 14px;
+                    min-width: 100px;
+                }
+                QPushButton:hover {
+                    background-color: #5a6268;
+                }
+                QPushButton:pressed {
+                    background-color: #4b5155;
+                }
+            """)
+            btn_add.clicked.connect(lambda: self.add_user(username_input.text(), password_input.text(), 
+                                                         role_selector.currentText(), dialog))
+            btn_cancel.clicked.connect(lambda: self.close_dialog(dialog))
+            btn_layout.addWidget(btn_add)
+            btn_layout.addWidget(btn_cancel)
+            form.addRow(btn_layout)
+
+            print("Showing Add User dialog")
+            dialog.exec()
+            self.active_dialog = None
+        except Exception as e:
+            print(f"Error in add_user_dialog: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to open Add User dialog: {e}")
+
+    def add_user(self, username, password, role, dialog):
+        try:
+            success, message = self.model.add_user(username, password, role)
+            if success:
+                QMessageBox.information(self, "Success", message)
+                self.close_dialog(dialog)
+                self.update_user_table()
+            else:
+                QMessageBox.warning(self, "Error", message)
+        except Exception as e:
+            print(f"Error in add_user: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to add user: {e}")
+
+    def update_user_table(self):
+        try:
+            users = self.model.get_users()
+            self.user_table.setRowCount(len(users))
+            for i, user in enumerate(users):
+                self.user_table.setItem(i, 0, QTableWidgetItem(user[0]))
+                self.user_table.setItem(i, 1, QTableWidgetItem(user[1]))
+            print("User table updated")
+        except Exception as e:
+            print(f"Error updating user table: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to update user table: {e}")
+
+    def delete_user_dialog(self):
+        print("Opening Delete User dialog")
+        try:
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Delete User")
+            dialog.setFixedSize(500, 200)
+            dialog.setStyleSheet("""
+                QDialog {
+                    background-color: #f5f7fa;
+                }
+                QLabel {
+                    color: #2c3e50;
+                    font-weight: bold;
+                }
+                QComboBox {
+                    padding: 8px;
+                    border: 1px solid #ddd;
+                    border-radius: 4px;
+                    font-size: 14px;
+                }
+                QComboBox:focus {
+                    border-color: #3498db;
+                }
+            """)
+            self.active_dialog = dialog
+            form = QFormLayout(dialog)
+            form.setSpacing(15)
+            form.setContentsMargins(20, 20, 20, 20)
+
+            username_selector = QComboBox()
+            username_selector.addItems([u[0] for u in self.model.get_users()])
+
+            form.addRow("Username:", username_selector)
+
+            btn_layout = QHBoxLayout()
+            btn_delete = QPushButton("Delete User")
+            btn_delete.setStyleSheet("""
+                QPushButton {
+                    background-color: #dc3545;
+                    color: white;
+                    padding: 10px 20px;
+                    border-radius: 5px;
+                    font-size: 14px;
+                    min-width: 100px;
+                }
+                QPushButton:hover {
+                    background-color: #c82333;
+                }
+                QPushButton:pressed {
+                    background-color: #b21f2d;
+                }
+            """)
+            btn_cancel = QPushButton("Cancel")
+            btn_cancel.setStyleSheet("""
+                QPushButton {
+                    background-color: #6c757d;
+                    color: white;
+                    padding: 10px 20px;
+                    border-radius: 5px;
+                    font-size: 14px;
+                    min-width: 100px;
+                }
+                QPushButton:hover {
+                    background-color: #5a6268;
+                }
+                QPushButton:pressed {
+                    background-color: #4b5155;
+                }
+            """)
+            btn_delete.clicked.connect(lambda: self.delete_user(username_selector.currentText(), dialog))
+            btn_cancel.clicked.connect(lambda: self.close_dialog(dialog))
+            btn_layout.addWidget(btn_delete)
+            btn_layout.addWidget(btn_cancel)
+            form.addRow(btn_layout)
+
+            print("Showing Delete User dialog")
+            dialog.exec()
+            self.active_dialog = None
+        except Exception as e:
+            print(f"Error in delete_user_dialog: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to open Delete User dialog: {e}")
+
+    def delete_user(self, username, dialog):
+        try:
+            success, message = self.model.delete_user(username)
+            if success:
+                QMessageBox.information(self, "Success", message)
+                self.close_dialog(dialog)
+                self.update_user_table()
+            else:
+                QMessageBox.warning(self, "Error", message)
+        except Exception as e:
+            print(f"Error in delete_user: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to delete user: {e}")
+
+    def book_passenger_dialog(self):
+        print("Opening Book Passenger dialog")
+        if self.user_role not in ["admin", "manager", "cashier"]:
+            QMessageBox.warning(self, "Access Denied", "You don't have permission to make bookings.")
+            return
+
+        try:
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Passenger Booking")
+            dialog.setFixedSize(600, 500)
+            dialog.setStyleSheet("""
+                QDialog {
+                    background-color: #f5f7fa;
+                }
+                QLabel {
+                    color: #2c3e50;
+                    font-weight: bold;
+                }
+                QLineEdit, QSpinBox, QComboBox, QDateEdit {
+                    padding: 8px;
+                    border: 1px solid #ddd;
+                    border-radius: 4px;
+                    font-size: 14px;
+                }
+                QLineEdit:focus, QSpinBox:focus, QComboBox:focus, QDateEdit:focus {
+                    border-color: #3498db;
+                }
+            """)
+            self.active_dialog = dialog
+            form = QFormLayout(dialog)
+            form.setSpacing(15)
+            form.setContentsMargins(20, 20, 20, 20)
+
+            passenger_name = QLineEdit()
+            route_selector = QComboBox()
+            route_selector.addItems([r[0] for r in self.model.get_routes()])
+            date_picker = QDateEdit()
+            date_picker.setDate(QDate.currentDate())
+            seat_no_input = QSpinBox()
+            seat_no_input.setRange(1, 100)
+            payment_status = QComboBox()
+            payment_status.addItems(["Paid", "Pending", "Cancelled"])
+            email_input = QLineEdit()
+            email_input.setPlaceholderText("e.g., user@example.com")
+            phone_input = QLineEdit()
+            phone_input.setPlaceholderText("e.g., +1234567890")
+
+            form.addRow("Passenger Name:", passenger_name)
+            form.addRow("Route:", route_selector)
+            form.addRow("Date:", date_picker)
+            form.addRow("Seat Number:", seat_no_input)
+            form.addRow("Payment Status:", payment_status)
+            form.addRow("Email:", email_input)
+            form.addRow("Phone:", phone_input)
+
+            btn_layout = QHBoxLayout()
+            btn_book = QPushButton("Book")
+            btn_book.setStyleSheet("""
+                QPushButton {
+                    background-color: #28a745;
+                    color: white;
+                    padding: 10px 20px;
+                    border-radius: 5px;
+                    font-size: 14px;
+                    min-width: 100px;
+                }
+                QPushButton:hover {
+                    background-color: #218838;
+                }
+                QPushButton:pressed {
+                    background-color: #1c6e30;
+                }
+            """)
+            btn_cancel = QPushButton("Cancel")
+            btn_cancel.setStyleSheet("""
+                QPushButton {
+                    background-color: #6c757d;
+                    color: white;
+                    padding: 10px 20px;
+                    border-radius: 5px;
+                    font-size: 14px;
+                    min-width: 100px;
+                }
+                QPushButton:hover {
+                    background-color: #5a6268;
+                }
+                QPushButton:pressed {
+                    background-color: #4b5155;
+                }
+            """)
+            btn_book.clicked.connect(lambda: self.book_passenger(passenger_name.text(), route_selector.currentText(), 
+                                                               date_picker.date(), seat_no_input.value(), 
+                                                               payment_status.currentText(), email_input.text(), 
+                                                               phone_input.text(), dialog))
+            btn_cancel.clicked.connect(lambda: self.close_dialog(dialog))
+            btn_layout.addWidget(btn_book)
+            btn_layout.addWidget(btn_cancel)
+            form.addRow(btn_layout)
+
+            print("Showing Book Passenger dialog")
+            dialog.exec()
+            self.active_dialog = None
+        except Exception as e:
+            print(f"Error in book_passenger_dialog: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to open Book Passenger dialog: {e}")
+
+    def book_passenger(self, name, route, date, seat_no, payment_status, email, phone, dialog):
+        try:
+            success, message = self.model.book_passenger(name, route, date.toString("yyyy-MM-dd"), seat_no, payment_status, email, phone)
+            if success:
+                qr_data = f"Passenger: {name}, Route: {route}, Date: {date.toString('yyyy-MM-dd')}, Seat: {seat_no}, Status: {payment_status}"
+                pdf = PDFReceipt()
+                pdf.add_page()
+                pdf.booking_info("Passenger Booking", {
+                    "Passenger": name,
+                    "Route": route,
+                    "Date": date.toString("yyyy-MM-dd"),
+                    "Seat Number": str(seat_no),
+                    "Payment Status": payment_status,
+                    "Email": email,
+                    "Phone": phone
+                }, qr_data)
+                pdf_file = f"ticket_{name}_{date.toString('yyyyMMdd')}.pdf"
+                pdf.output(pdf_file)
+                QMessageBox.information(self, "Success", f"{message} Receipt saved as {pdf_file}")
+                self.close_dialog(dialog)
+                self.update_booking_table()
+            else:
+                QMessageBox.warning(self, "Error", message)
+        except Exception as e:
+            print(f"Error in book_passenger: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to book passenger: {e}")
+
+    def update_booking_table(self):
+        try:
+            bookings = self.model.get_bookings()
+            self.booking_table.setRowCount(len(bookings))
+            for i, booking in enumerate(bookings):
+                self.booking_table.setItem(i, 0, QTableWidgetItem(booking[0]))
+                self.booking_table.setItem(i, 1, QTableWidgetItem(booking[1]))
+                self.booking_table.setItem(i, 2, QTableWidgetItem(booking[2]))
+                self.booking_table.setItem(i, 3, QTableWidgetItem(str(booking[3])))
+                self.booking_table.setItem(i, 4, QTableWidgetItem(booking[4]))
+                self.booking_table.setItem(i, 5, QTableWidgetItem(booking[5]))
+                self.booking_table.setItem(i, 6, QTableWidgetItem(booking[6]))
+            print("Booking table updated")
+        except Exception as e:
+            print(f"Error updating booking table: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to update booking table: {e}")
+
+    def add_cargo_dialog(self):
+        print("Opening Add Cargo dialog")
+        if self.user_role not in ["admin", "manager", "clerk"]:
+            QMessageBox.warning(self, "Access Denied", "You don't have permission to book cargo.")
+            return
+
+        try:
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Cargo Booking")
+            dialog.setFixedSize(700, 600)
+            dialog.setStyleSheet("""
+                QDialog {
+                    background-color: #f5f7fa;
+                }
+                QLabel {
+                    color: #2c3e50;
+                    font-weight: bold;
+                }
+                QLineEdit, QSpinBox, QComboBox, QDateEdit {
+                    padding: 8px;
+                    border: 1px solid #ddd;
+                    border-radius: 4px;
+                    font-size: 14px;
+                }
+                QLineEdit:focus, QSpinBox:focus, QComboBox:focus, QDateEdit:focus {
+                    border-color: #3498db;
+                }
+            """)
+            self.active_dialog = dialog
+            form = QFormLayout(dialog)
+            form.setSpacing(15)
+            form.setContentsMargins(20, 20, 20, 20)
+
+            sender_input = QLineEdit()
+            receiver_input = QLineEdit()
+            route_selector = QComboBox()
+            route_selector.addItems([r[0] for r in self.model.get_routes()])
+            date_picker = QDateEdit()
+            date_picker.setDate(QDate.currentDate())
+            description_input = QLineEdit()
+            payment_status = QComboBox()
+            payment_status.addItems(["Paid", "Pending", "Cancelled"])
+            weight_input = QSpinBox()
+            weight_input.setRange(1, 1000)
+            weight_input.setValue(1)
+            sender_phone_input = QLineEdit()
+            sender_phone_input.setPlaceholderText("e.g., +1234567890")
+            receiver_phone_input = QLineEdit()
+            receiver_phone_input.setPlaceholderText("e.g., +1234567890")
+
+            form.addRow("Sender Name:", sender_input)
+            form.addRow("Receiver Name:", receiver_input)
+            form.addRow("Route:", route_selector)
+            form.addRow("Date:", date_picker)
+            form.addRow("Description:", description_input)
+            form.addRow("Payment Status:", payment_status)
+            form.addRow("Weight (kg):", weight_input)
+            form.addRow("Sender Phone:", sender_phone_input)
+            form.addRow("Receiver Phone:", receiver_phone_input)
+
+            btn_layout = QHBoxLayout()
+            btn_book = QPushButton("Book Cargo")
+            btn_book.setStyleSheet("""
+                QPushButton {
+                    background-color: #28a745;
+                    color: white;
+                    padding: 10px 20px;
+                    border-radius: 5px;
+                    font-size: 14px;
+                    min-width: 100px;
+                }
+                QPushButton:hover {
+                    background-color: #218838;
+                }
+                QPushButton:pressed {
+                    background-color: #1c6e30;
+                }
+            """)
+            btn_cancel = QPushButton("Cancel")
+            btn_cancel.setStyleSheet("""
+                QPushButton {
+                    background-color: #6c757d;
+                    color: white;
+                    padding: 10px 20px;
+                    border-radius: 5px;
+                    font-size: 14px;
+                    min-width: 100px;
+                }
+                QPushButton:hover {
+                    background-color: #5a6268;
+                }
+                QPushButton:pressed {
+                    background-color: #4b5155;
+                }
+            """)
+            btn_book.clicked.connect(lambda: self.book_cargo(sender_input.text(), receiver_input.text(), 
+                                                            route_selector.currentText(), date_picker.date(), 
+                                                            description_input.text(), payment_status.currentText(), 
+                                                            weight_input.value(), sender_phone_input.text(), 
+                                                            receiver_phone_input.text(), dialog))
+            btn_cancel.clicked.connect(lambda: self.close_dialog(dialog))
+            btn_layout.addWidget(btn_book)
+            btn_layout.addWidget(btn_cancel)
+            form.addRow(btn_layout)
+
+            print("Showing Add Cargo dialog")
+            dialog.exec()
+            self.active_dialog = None
+        except Exception as e:
+            print(f"Error in add_cargo_dialog: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to open Add Cargo dialog: {e}")
+
+    def book_cargo(self, sender, receiver, route, date, description, payment_status, weight, sender_phone, receiver_phone, dialog):
+        try:
+            # Validate inputs
+            if not isinstance(date, QDate) or not date.isValid():
+                QMessageBox.warning(self, "Error", "Invalid date provided.")
+                return
+            if not weight or weight <= 0:
+                QMessageBox.warning(self, "Error", "Weight must be a positive number.")
+                return
+
+            success, message, cargo_id = self.model.add_cargo(
+                sender, receiver, route, date.toString("yyyy-MM-dd"),
+                description, payment_status, weight, sender_phone, receiver_phone
+            )
+            if success:
+                qr_data = f"Cargo ID: {cargo_id}, Sender: {sender}, Receiver: {receiver}, Route: {route}, Date: {date.toString('yyyy-MM-dd')}, Status: {payment_status}"
+                pdf = PDFReceipt()
+                pdf.add_page()
+                pdf.booking_info("Cargo Booking", {
+                    "Cargo ID": str(cargo_id),
+                    "Sender": sender,
+                    "Receiver": receiver,
+                    "Route": route,
+                    "Date": date.toString("yyyy-MM-dd"),
+                    "Description": description,
+                    "Payment Status": payment_status,
+                    "Weight": f"{weight} kg",
+                    "Sender Phone": sender_phone,
+                    "Receiver Phone": receiver_phone
+                }, qr_data)
+                # Save PDF to a dedicated directory
+                import os
+                output_dir = os.path.join(os.path.expanduser("~"), "CargoReceipts")
+                os.makedirs(output_dir, exist_ok=True)
+                pdf_file = os.path.join(output_dir, f"cargo_receipt_{cargo_id}.pdf")
+                pdf.output(pdf_file)
+                QMessageBox.information(self, "Success", f"{message} Receipt saved as {pdf_file}")
+                self.close_dialog(dialog)
+                self.update_cargo_table()
+            else:
+                QMessageBox.warning(self, "Error", message)
+        except Exception as e:
+            import logging
+            logging.error(f"Error in book_cargo: {e}")
+            QMessageBox.critical(self, "Error", "An unexpected error occurred while booking cargo. Please try again or contact support.")
+
+    def update_cargo_table(self):
+        try:
+            cargo = self.model.get_cargo()
+            self.cargo_table.setRowCount(len(cargo))
+            for i, item in enumerate(cargo):
+                self.cargo_table.setItem(i, 0, QTableWidgetItem(str(item[0])))
+                self.cargo_table.setItem(i, 1, QTableWidgetItem(item[1]))
+                self.cargo_table.setItem(i, 2, QTableWidgetItem(item[2]))
+                self.cargo_table.setItem(i, 3, QTableWidgetItem(item[3]))
+                self.cargo_table.setItem(i, 4, QTableWidgetItem(item[4]))
+                self.cargo_table.setItem(i, 5, QTableWidgetItem(item[6]))
+            print("Cargo table updated")
+        except Exception as e:
+            print(f"Error updating cargo table: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to update cargo table: {e}")
+
+    def search_dialog(self):
+        print("Opening Search dialog")
+        try:
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Search Bookings")
+            dialog.setFixedSize(500, 300)
+            dialog.setStyleSheet("""
+                QDialog {
+                    background-color: #f5f7fa;
+                }
+                QLabel {
+                    color: #2c3e50;
+                    font-weight: bold;
+                }
+                QLineEdit, QComboBox {
+                    padding: 8px;
+                    border: 1px solid #ddd;
+                    border-radius: 4px;
+                    font-size: 14px;
+                }
+                QLineEdit:focus, QComboBox:focus {
+                    border-color: #3498db;
+                }
+            """)
+            self.active_dialog = dialog
+            form = QFormLayout(dialog)
+            form.setSpacing(15)
+            form.setContentsMargins(20, 20, 20, 20)
+
+            search_input = QLineEdit()
+            search_type = QComboBox()
+            search_type.addItems(["All", "Passenger", "Cargo"])
+
+            form.addRow("Search Query:", search_input)
+            form.addRow("Search Type:", search_type)
+
+            btn_layout = QHBoxLayout()
+            btn_search = QPushButton("Search")
+            btn_search.setStyleSheet("""
+                QPushButton {
+                    background-color: #17a2b8;
+                    color: white;
+                    padding: 10px 20px;
+                    border-radius: 5px;
+                    font-size: 14px;
+                    min-width: 100px;
+                }
+                QPushButton:hover {
+                    background-color: #138496;
+                }
+                QPushButton:pressed {
+                    background-color: #117a8b;
+                }
+            """)
+            btn_cancel = QPushButton("Cancel")
+            btn_cancel.setStyleSheet("""
+                QPushButton {
+                    background-color: #6c757d;
+                    color: white;
+                    padding: 10px 20px;
+                    border-radius: 5px;
+                    font-size: 14px;
+                    min-width: 100px;
+                }
+                QPushButton:hover {
+                    background-color: #5a6268;
+                }
+                QPushButton:pressed {
+                    background-color: #4b5155;
+                }
+            """)
+            btn_search.clicked.connect(lambda: self.perform_search(search_input.text(), search_type.currentText().lower(), dialog))
+            btn_cancel.clicked.connect(lambda: self.close_dialog(dialog))
+            btn_layout.addWidget(btn_search)
+            btn_layout.addWidget(btn_cancel)
+            form.addRow(btn_layout)
+
+            print("Showing Search dialog")
+            dialog.exec()
+            self.active_dialog = None
+        except Exception as e:
+            print(f"Error in search_dialog: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to open Search dialog: {e}")
+
+    def perform_search(self, query, search_type, dialog):
+        try:
+            if search_type == "all":
+                bookings, cargo = self.model.search_bookings(query, search_type)
+                self.show_search_results(bookings, cargo)
+            elif search_type == "passenger":
+                results = self.model.search_bookings(query, search_type)
+                self.show_search_results(results, [])
+            elif search_type == "cargo":
+                results = self.model.search_bookings(query, search_type)
+                self.show_search_results([], results)
+            self.close_dialog(dialog)
+        except Exception as e:
+            print(f"Error in perform_search: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to perform search: {e}")
+
+    def show_search_results(self, bookings, cargo):
+        try:
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Search Results")
+            dialog.setFixedSize(800, 600)
+            dialog.setStyleSheet("""
+                QDialog {
+                    background-color: #f5f7fa;
+                }
+            """)
+            layout = QVBoxLayout(dialog)
+            layout.setContentsMargins(20, 20, 20, 20)
+
+            table = QTableWidget()
+            table.setStyleSheet("""
+                QTableWidget {
+                    border: 1px solid #ddd;
+                    border-radius: 5px;
+                    background-color: white;
+                    alternate-background-color: #f9f9f9;
+                }
+                QHeaderView::section {
+                    background-color: #3498db;
+                    color: white;
+                    padding: 8px;
+                    border: none;
+                    font-weight: bold;
+                }
+                QTableWidget::item {
+                    padding: 8px;
+                    border-bottom: 1px solid #eee;
+                }
+            """)
+            table.setColumnCount(8)
+            table.setHorizontalHeaderLabels(["Type", "Name/ID", "Route", "Date", "Details", "Status", "Extra 1", "Extra 2"])
+            table.horizontalHeader().setStretchLastSection(True)
+            table.verticalHeader().setVisible(False)
+            table.setAlternatingRowColors(True)
+
+            row_count = len(bookings) + len(cargo)
+            table.setRowCount(row_count)
+
+            for i, booking in enumerate(bookings):
+                table.setItem(i, 0, QTableWidgetItem("Passenger"))
+                table.setItem(i, 1, QTableWidgetItem(booking[0]))
+                table.setItem(i, 2, QTableWidgetItem(booking[1]))
+                table.setItem(i, 3, QTableWidgetItem(booking[2]))
+                table.setItem(i, 4, QTableWidgetItem(f"Seat: {booking[3]}"))
+                table.setItem(i, 5, QTableWidgetItem(booking[4]))
+                table.setItem(i, 6, QTableWidgetItem(booking[5]))
+                table.setItem(i, 7, QTableWidgetItem(booking[6]))
+
+            for i, item in enumerate(cargo, len(bookings)):
+                table.setItem(i, 0, QTableWidgetItem("Cargo"))
+                table.setItem(i, 1, QTableWidgetItem(str(item[0])))
+                table.setItem(i, 2, QTableWidgetItem(item[3]))
+                table.setItem(i, 3, QTableWidgetItem(item[4]))
+                table.setItem(i, 4, QTableWidgetItem(f"Sender: {item[1]}, Receiver: {item[2]}"))
+                table.setItem(i, 5, QTableWidgetItem(item[6]))
+                table.setItem(i, 6, QTableWidgetItem(f"Weight: {item[7]} kg"))
+                table.setItem(i, 7, QTableWidgetItem(item[5]))
+
+            layout.addWidget(table)
+
+            btn_close = QPushButton("Close")
+            btn_close.setStyleSheet("""
+                QPushButton {
+                    background-color: #6c757d;
+                    color: white;
+                    padding: 10px 20px;
+                    border-radius: 5px;
+                    font-size: 14px;
+                    min-width: 100px;
+                }
+                QPushButton:hover {
+                    background-color: #5a6268;
+                }
+                QPushButton:pressed {
+                    background-color: #4b5155;
+                }
+            """)
+            btn_close.clicked.connect(dialog.accept)
+            layout.addWidget(btn_close, alignment=Qt.AlignmentFlag.AlignRight)
+
+            dialog.exec()
+        except Exception as e:
+            print(f"Error in show_search_results: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to show search results: {e}")
+
+    def view_data(self):
+        try:
+            bookings = self.model.get_bookings()
+            cargo = self.model.get_cargo()
+            self.data_table.setRowCount(len(bookings) + len(cargo))
+
+            for i, booking in enumerate(bookings):
+                self.data_table.setItem(i, 0, QTableWidgetItem("Passenger"))
+                self.data_table.setItem(i, 1, QTableWidgetItem(booking[0]))
+                self.data_table.setItem(i, 2, QTableWidgetItem(booking[1]))
+                self.data_table.setItem(i, 3, QTableWidgetItem(booking[2]))
+                self.data_table.setItem(i, 4, QTableWidgetItem(str(booking[3])))
+                self.data_table.setItem(i, 5, QTableWidgetItem(booking[4]))
+                self.data_table.setItem(i, 6, QTableWidgetItem(booking[5]))
+                self.data_table.setItem(i, 7, QTableWidgetItem(booking[6]))
+
+            for i, item in enumerate(cargo, len(bookings)):
+                self.data_table.setItem(i, 0, QTableWidgetItem("Cargo"))
+                self.data_table.setItem(i, 1, QTableWidgetItem(str(item[0])))
+                self.data_table.setItem(i, 2, QTableWidgetItem(item[3]))
+                self.data_table.setItem(i, 3, QTableWidgetItem(item[4]))
+                self.data_table.setItem(i, 4, QTableWidgetItem(item[5]))
+                self.data_table.setItem(i, 5, QTableWidgetItem(item[6]))
+                self.data_table.setItem(i, 6, QTableWidgetItem(f"{item[7]} kg"))
+                self.data_table.setItem(i, 7, QTableWidgetItem(f"Sender: {item[1]}, Receiver: {item[2]}"))
+            print("Data table updated")
+        except Exception as e:
+            print(f"Error in view_data: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to update data table: {e}")
+
+    def export_data(self):
+        try:
+            success, message = self.model.export_to_csv("bus_data.csv")
+            if success:
+                QMessageBox.information(self, "Success", message)
+            else:
+                QMessageBox.warning(self, "Error", message)
+        except Exception as e:
+            print(f"Error in export_data: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to export data: {e}")
+
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    window = BusCompanyApp()
+    window.show()
+    sys.exit(app.exec())
